@@ -1035,7 +1035,7 @@ func (as *availabilitySet) EnsureBackendPoolDeleted(ctx context.Context, service
 			continue
 		}
 		nodeName, _, err := as.GetNodeNameByIPConfigurationID(ctx, ipConfigurationID)
-		if err != nil && !errors.Is(err, cloudprovider.InstanceNotFound) {
+		if err != nil && !errors.Is(err, cloudprovider.InstanceNotFound) && !errors.Is(err, errNICNotFound) {
 			logger.Error(err, "Failed to GetNodeNameByIPConfigurationID", "ipConfigurationID", ipConfigurationID)
 			allErrs = append(allErrs, err)
 			continue
@@ -1156,7 +1156,7 @@ func (as *availabilitySet) GetNodeNameByIPConfigurationID(ctx context.Context, i
 	}
 	nic, rerr := as.ComputeClientFactory.GetInterfaceClient().Get(ctx, nicResourceGroup, nicName, nil)
 	if rerr != nil {
-		return "", "", fmt.Errorf("GetNodeNameByIPConfigurationID(%s): failed to get interface of name %s: %w", ipConfigurationID, nicName, rerr)
+		return "", "", fmt.Errorf("GetNodeNameByIPConfigurationID(%s): failed to get interface of name %s: %w", ipConfigurationID, nicName, wrapNICNotFound(rerr))
 	}
 	vmID := ""
 	if nic.Properties != nil && nic.Properties.VirtualMachine != nil {

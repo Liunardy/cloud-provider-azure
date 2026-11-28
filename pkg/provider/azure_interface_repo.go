@@ -18,6 +18,8 @@ package provider
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
@@ -27,7 +29,20 @@ import (
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	"sigs.k8s.io/cloud-provider-azure/pkg/log"
+	"sigs.k8s.io/cloud-provider-azure/pkg/util/errutils"
 )
+
+var (
+	errNICNotAttachedToVM = errors.New("NIC is not attached to a VM")
+	errNICNotFound        = errors.New("NIC not found")
+)
+
+func wrapNICNotFound(err error) error {
+	if exists, checkErr := errutils.CheckResourceExistsFromAzcoreError(err); !exists && checkErr == nil {
+		return fmt.Errorf("%w: %w", errNICNotFound, err)
+	}
+	return err
+}
 
 // updateInterface updates the NIC but will not create it if it doesn't exist.
 func (az *Cloud) updateInterface(ctx context.Context, nic *armnetwork.Interface) (*armnetwork.Interface, error) {

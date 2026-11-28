@@ -1596,55 +1596,121 @@ func TestStandardEnsureHostsInPool(t *testing.T) {
 }
 
 func TestStandardEnsureBackendPoolDeleted(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-	cloud := GetTestCloud(ctrl)
+	const (
+		resourcePrefix = "/subscriptions/subscription/resourceGroups/rg/providers/"
+		servicePoolID  = "backendPoolID"
+		outboundPoolID = "outboundBackendPoolID"
+		vmSetName      = "AS"
+	)
+	type nicLookup struct {
+		name           string
+		vmName         string
+		backendPoolIDs []string
+		nicGetErr      error
+		vmGetErr       error
+	}
 	service := getTestService("test", v1.ProtocolTCP, nil, false, 80)
-	backendPoolID := "backendPoolID"
-	vmSetName := "AS"
+	attachedNIC := nicLookup{name: "k8s-agentpool1-00000000-nic-1", vmName: "k8s-agentpool1-00000000-1", backendPoolIDs: []string{servicePoolID}}
+	nicInServiceAndOutboundPools := attachedNIC
+	nicInServiceAndOutboundPools.backendPoolIDs = []string{servicePoolID, outboundPoolID}
+	detachedNIC := nicLookup{name: "detached-nic", backendPoolIDs: []string{servicePoolID}}
+	notFound := &azcore.ResponseError{StatusCode: http.StatusNotFound}
+	missingNIC := nicLookup{name: "lookup-nic", nicGetErr: notFound}
+	forbidden := &azcore.ResponseError{StatusCode: http.StatusForbidden}
 
 	tests := []struct {
-		desc                string
-		backendAddressPools []*armnetwork.BackendAddressPool
-		loadBalancerSKU     string
-		existingVM          *armcompute.VirtualMachine
-		existingNIC         *armnetwork.Interface
+		desc              string
+		nicLookups        []nicLookup
+		expectedNICWrites map[string][]string // NIC name to remaining backend pool IDs
+		expectedErr       error
 	}{
 		{
-			desc: "EnsureBackendPoolDeleted should decouple the nic and the load balancer properly",
-			backendAddressPools: []*armnetwork.BackendAddressPool{
-				{
-					ID: ptr.To(backendPoolID),
-					Properties: &armnetwork.BackendAddressPoolPropertiesFormat{
-						BackendIPConfigurations: []*armnetwork.InterfaceIPConfiguration{
-							{
-								ID: ptr.To("/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/k8s-agentpool1-00000000-nic-1/ipConfigurations/ipconfig1"),
-							},
-						},
-					},
-				},
-			},
-			existingVM: buildDefaultTestVirtualMachine("/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Compute/availabilitySets/as", []string{
-				"/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/k8s-agentpool1-00000000-nic-1",
-			}),
-			existingNIC: buildDefaultTestInterface(true, []string{"/subscriptions/sub/resourceGroups/gh/providers/Microsoft.Network/loadBalancers/testCluster/backendAddressPools/testCluster"}),
+			desc:              "NIC IP configuration references the target pool: update the NIC to remove that reference",
+			nicLookups:        []nicLookup{attachedNIC},
+			expectedNICWrites: map[string][]string{attachedNIC.name: {}},
+		},
+		{
+			desc:              "one NIC IP configuration references the Service and outbound pools: remove the Service reference and keep the outbound reference",
+			nicLookups:        []nicLookup{nicInServiceAndOutboundPools},
+			expectedNICWrites: map[string][]string{nicInServiceAndOutboundPools.name: {outboundPoolID}},
+		},
+		{
+			desc:       "only NIC references the Service pool but has no VM: succeed without updating the NIC",
+			nicLookups: []nicLookup{detachedNIC},
+		},
+		{
+			desc:              "first NIC has no VM and the second NIC is attached: remove the Service pool reference only from the attached NIC",
+			nicLookups:        []nicLookup{detachedNIC, attachedNIC},
+			expectedNICWrites: map[string][]string{attachedNIC.name: {}},
+		},
+		{
+			desc:       "NIC references a VM whose lookup returns 404: succeed without updating the NIC",
+			nicLookups: []nicLookup{{name: "stale-vm-nic", vmName: "missing-vm", backendPoolIDs: []string{servicePoolID}, vmGetErr: notFound}},
+		},
+		{
+			desc:       "pool lists one NIC and its lookup returns 404: succeed without updating any NIC",
+			nicLookups: []nicLookup{missingNIC},
+		},
+		{
+			desc:              "first NIC lookup returns 404 and the second NIC references the target pool: update only the second NIC to remove that reference",
+			nicLookups:        []nicLookup{missingNIC, attachedNIC},
+			expectedNICWrites: map[string][]string{attachedNIC.name: {}},
+		},
+		{
+			desc:        "NIC lookup returns 403: propagate the permission error without updating any NIC",
+			nicLookups:  []nicLookup{{name: "lookup-nic", nicGetErr: forbidden}},
+			expectedErr: forbidden,
 		},
 	}
 
 	for _, test := range tests {
-		cloud.LoadBalancerSKU = test.loadBalancerSKU
-		mockVMClient := cloud.ComputeClientFactory.GetVirtualMachineClient().(*mock_virtualmachineclient.MockInterface)
-		mockVMClient.EXPECT().Get(gomock.Any(), cloud.ResourceGroup, "k8s-agentpool1-00000000-1", gomock.Any()).Return(test.existingVM, nil)
-		mockNICClient := cloud.ComputeClientFactory.GetInterfaceClient().(*mock_interfaceclient.MockInterface)
-		test.existingNIC.Properties.VirtualMachine = &armnetwork.SubResource{
-			ID: ptr.To("/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/k8s-agentpool1-00000000-1"),
-		}
-		mockNICClient.EXPECT().Get(gomock.Any(), "rg", "k8s-agentpool1-00000000-nic-1", gomock.Any()).Return(test.existingNIC, nil).Times(2)
-		mockNICClient.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil)
+		t.Run(test.desc, func(t *testing.T) {
+			cloud := GetTestCloud(gomock.NewController(t))
+			mockNICClient := cloud.ComputeClientFactory.GetInterfaceClient().(*mock_interfaceclient.MockInterface)
+			mockVMClient := cloud.ComputeClientFactory.GetVirtualMachineClient().(*mock_virtualmachineclient.MockInterface)
+			var ipConfigIDs []string
+			for _, lookup := range test.nicLookups {
+				nicID := resourcePrefix + "Microsoft.Network/networkInterfaces/" + lookup.name
+				ipConfigIDs = append(ipConfigIDs, nicID+"/ipConfigurations/ipconfig1")
+				getNIC := mockNICClient.EXPECT().Get(gomock.Any(), cloud.ResourceGroup, lookup.name, nil)
+				if lookup.nicGetErr != nil {
+					getNIC.Return(nil, lookup.nicGetErr)
+					continue
+				}
 
-		nicUpdated, err := cloud.VMSet.EnsureBackendPoolDeleted(context.TODO(), &service, []string{backendPoolID}, vmSetName, test.backendAddressPools, true)
-		assert.NoError(t, err, test.desc)
-		assert.True(t, nicUpdated)
+				nic := buildDefaultTestInterface(true, lookup.backendPoolIDs)
+				nic.Name = ptr.To(lookup.name)
+				if lookup.vmName != "" {
+					nic.Properties.VirtualMachine = &armnetwork.SubResource{ID: ptr.To(resourcePrefix + "Microsoft.Compute/virtualMachines/" + lookup.vmName)}
+					getVM := mockVMClient.EXPECT().Get(gomock.Any(), cloud.ResourceGroup, lookup.vmName, gomock.Any())
+					if lookup.vmGetErr != nil {
+						getVM.Return(nil, lookup.vmGetErr)
+					} else {
+						vm := buildDefaultTestVirtualMachine(resourcePrefix+"Microsoft.Compute/availabilitySets/as", []string{nicID})
+						getVM.Return(vm, nil)
+						getNIC.Times(2)
+					}
+				}
+				getNIC.Return(nic, nil)
+			}
+			for nicName, expectedPoolIDs := range test.expectedNICWrites {
+				mockNICClient.EXPECT().CreateOrUpdate(gomock.Any(), cloud.ResourceGroup, nicName, gomock.Any()).
+					DoAndReturn(func(_ context.Context, _, _ string, updatedNIC armnetwork.Interface) (*armnetwork.Interface, error) {
+						var actualPoolIDs []string
+						for _, pool := range updatedNIC.Properties.IPConfigurations[0].Properties.LoadBalancerBackendAddressPools {
+							actualPoolIDs = append(actualPoolIDs, ptr.Deref(pool.ID, ""))
+						}
+						assert.ElementsMatch(t, expectedPoolIDs, actualPoolIDs)
+						return nil, nil
+					})
+			}
+
+			lb := buildDefaultTestLB(testClusterName, ipConfigIDs)
+			lb.Properties.BackendAddressPools[0].ID = ptr.To(servicePoolID)
+			nicUpdated, err := cloud.VMSet.EnsureBackendPoolDeleted(t.Context(), &service, []string{servicePoolID}, vmSetName, lb.Properties.BackendAddressPools, true)
+			assert.ErrorIs(t, err, test.expectedErr)
+			assert.Equal(t, len(test.expectedNICWrites) > 0, nicUpdated)
+		})
 	}
 }
 
@@ -1691,24 +1757,94 @@ func buildDefaultTestVirtualMachine(asID string, nicIDs []string) *armcompute.Vi
 }
 
 func TestStandardGetNodeNameByIPConfigurationID(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-	cloud := GetTestCloud(ctrl)
-	expectedVM := buildDefaultTestVirtualMachine("/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/availabilitySets/AGENTPOOL1-AVAILABILITYSET-00000000", []string{})
-	expectedVM.Name = ptr.To("name")
-	mockVMClient := cloud.ComputeClientFactory.GetVirtualMachineClient().(*mock_virtualmachineclient.MockInterface)
-	mockVMClient.EXPECT().Get(gomock.Any(), "rg", "k8s-agentpool1-00000000-0", gomock.Any()).Return(expectedVM, nil)
-	expectedNIC := buildDefaultTestInterface(true, []string{})
-	expectedNIC.Properties.VirtualMachine = &armnetwork.SubResource{
-		ID: ptr.To("/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/k8s-agentpool1-00000000-0"),
+	const (
+		nicName           = "k8s-agentpool1-00000000-nic-0"
+		vmName            = "k8s-agentpool1-00000000-0"
+		ipConfigurationID = "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/" + nicName + "/ipConfigurations/ipconfig1"
+	)
+	attachedNIC := buildDefaultTestInterface(true, nil)
+	attachedNIC.Properties.VirtualMachine = &armnetwork.SubResource{ID: ptr.To("/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/" + vmName)}
+	attachedVM := buildDefaultTestVirtualMachine("/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/availabilitySets/AGENTPOOL1-AVAILABILITYSET-00000000", nil)
+	notFound := &azcore.ResponseError{StatusCode: http.StatusNotFound}
+	forbidden := &azcore.ResponseError{StatusCode: http.StatusForbidden}
+
+	for _, test := range []struct {
+		desc             string
+		nic              *armnetwork.Interface
+		nicGetErr        error
+		vm               *armcompute.VirtualMachine
+		vmGetErr         error
+		expectedNodeName string
+		expectedASName   string
+		expectedErr      error
+		errMustNotMatch  error
+	}{
+		{
+			desc:             "attached NIC resolves its node and availability set",
+			nic:              attachedNIC,
+			vm:               attachedVM,
+			expectedNodeName: vmName,
+			expectedASName:   "agentpool1-availabilityset-00000000",
+		},
+		{
+			desc: "NIC without a VM returns no node",
+			nic:  &armnetwork.Interface{Properties: &armnetwork.InterfacePropertiesFormat{}},
+		},
+		{
+			desc: "NIC with a VM reference but no VM ID returns no node",
+			nic:  &armnetwork.Interface{Properties: &armnetwork.InterfacePropertiesFormat{VirtualMachine: &armnetwork.SubResource{}}},
+		},
+		{
+			desc: "NIC without properties returns no node",
+			nic:  &armnetwork.Interface{},
+		},
+		{
+			desc:            "NIC GET 404 identifies a missing NIC, not a missing VM",
+			nicGetErr:       notFound,
+			expectedErr:     errNICNotFound,
+			errMustNotMatch: cloudprovider.InstanceNotFound,
+		},
+		{
+			desc:            "NIC GET 403 returns the permission error, not a missing NIC",
+			nicGetErr:       forbidden,
+			expectedErr:     forbidden,
+			errMustNotMatch: errNICNotFound,
+		},
+		{
+			desc:            "NIC references a VM whose GET returns 404: report a missing VM, not a missing NIC",
+			nic:             attachedNIC,
+			vmGetErr:        notFound,
+			expectedErr:     cloudprovider.InstanceNotFound,
+			errMustNotMatch: errNICNotFound,
+		},
+	} {
+		t.Run(test.desc, func(t *testing.T) {
+			cloud := GetTestCloud(gomock.NewController(t))
+			mockNICClient := cloud.ComputeClientFactory.GetInterfaceClient().(*mock_interfaceclient.MockInterface)
+			mockNICClient.EXPECT().Get(gomock.Any(), "rg", nicName, nil).Return(test.nic, test.nicGetErr)
+			if test.vm != nil || test.vmGetErr != nil {
+				mockVMClient := cloud.ComputeClientFactory.GetVirtualMachineClient().(*mock_virtualmachineclient.MockInterface)
+				mockVMClient.EXPECT().Get(gomock.Any(), "rg", vmName, gomock.Any()).Return(test.vm, test.vmGetErr)
+			}
+
+			nodeName, asName, err := cloud.VMSet.GetNodeNameByIPConfigurationID(t.Context(), ipConfigurationID)
+			assert.Equal(t, test.expectedNodeName, nodeName)
+			assert.Equal(t, test.expectedASName, asName)
+			assert.ErrorIs(t, err, test.expectedErr)
+			if test.nicGetErr != nil {
+				assert.ErrorIs(t, err, test.nicGetErr)
+			}
+			if test.errMustNotMatch != nil {
+				assert.NotErrorIs(t, err, test.errMustNotMatch)
+			}
+		})
 	}
-	mockNICClient := cloud.ComputeClientFactory.GetInterfaceClient().(*mock_interfaceclient.MockInterface)
-	mockNICClient.EXPECT().Get(gomock.Any(), "rg", "k8s-agentpool1-00000000-nic-0", gomock.Any()).Return(expectedNIC, nil)
-	ipConfigurationID := `/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/k8s-agentpool1-00000000-nic-0/ipConfigurations/ipconfig1`
-	nodeName, asName, err := cloud.VMSet.GetNodeNameByIPConfigurationID(context.TODO(), ipConfigurationID)
-	assert.NoError(t, err)
-	assert.Equal(t, "k8s-agentpool1-00000000-0", nodeName)
-	assert.Equal(t, "agentpool1-availabilityset-00000000", asName)
+
+	t.Run("reject an invalid IP configuration ID before looking up a NIC", func(t *testing.T) {
+		cloud := GetTestCloud(gomock.NewController(t))
+		_, _, err := cloud.VMSet.GetNodeNameByIPConfigurationID(t.Context(), "invalid")
+		assert.ErrorContains(t, err, "invalid ip config ID")
+	})
 }
 
 func TestGetAvailabilitySetByNodeName(t *testing.T) {

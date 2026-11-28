@@ -18,7 +18,6 @@ package provider
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"testing"
@@ -361,6 +360,10 @@ func TestGetVMManagementTypeByIPConfigurationID(t *testing.T) {
 	testVM2NIC := buildTestNICWithVMName("testvm2")
 	testVM3NIC := buildTestNICWithVMName("testvm3")
 	testVM3NIC.Properties.VirtualMachine = nil
+	nicGetFailure := &azcore.ResponseError{ErrorCode: "failed to get nic"}
+	vmListFailure := &azcore.ResponseError{ErrorCode: "failed to list VMs"}
+	forbidden := &azcore.ResponseError{StatusCode: http.StatusForbidden}
+	vmListNotFound := &azcore.ResponseError{StatusCode: http.StatusNotFound}
 
 	testCases := []struct {
 		description                 string
@@ -395,15 +398,31 @@ func TestGetVMManagementTypeByIPConfigurationID(t *testing.T) {
 			ipConfigurationID:        "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/testvm3-interface/ipConfigurations/pipConfig",
 			expectedNIC:              "testvm3",
 			expectedVMManagementType: ManagedByUnknownVMSet,
-			expectedErr:              fmt.Errorf("failed to get vm name by ip config ID /subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/testvm3-interface/ipConfigurations/pipConfig: %w", errors.New("failed to get vm ID of nic testvm3")),
+			expectedErr:              errNICNotAttachedToVM,
 		},
 		{
 			description:              "getVMManagementTypeByIPConfigurationID should return an error if failed to get nic",
 			ipConfigurationID:        "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/testvm1-nic/ipConfigurations/pipConfig",
 			expectedNIC:              "testvm1",
-			nicGetErr:                &azcore.ResponseError{ErrorCode: "failed to get nic"},
+			nicGetErr:                nicGetFailure,
 			expectedVMManagementType: ManagedByUnknownVMSet,
-			expectedErr:              fmt.Errorf("failed to get nic"),
+			expectedErr:              nicGetFailure,
+		},
+		{
+			description:              "getVMManagementTypeByIPConfigurationID should return errNICNotFound for a NIC GET 404",
+			ipConfigurationID:        "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/testvm1-nic/ipConfigurations/pipConfig",
+			expectedNIC:              "testvm1",
+			nicGetErr:                fmt.Errorf("NIC GET: %w", &azcore.ResponseError{StatusCode: http.StatusNotFound}),
+			expectedVMManagementType: ManagedByUnknownVMSet,
+			expectedErr:              errNICNotFound,
+		},
+		{
+			description:              "getVMManagementTypeByIPConfigurationID should return the original NIC GET error for HTTP 403",
+			ipConfigurationID:        "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/testvm1-nic/ipConfigurations/pipConfig",
+			expectedNIC:              "testvm1",
+			nicGetErr:                forbidden,
+			expectedVMManagementType: ManagedByUnknownVMSet,
+			expectedErr:              forbidden,
 		},
 		{
 			description:              "getVMManagementTypeByIPConfigurationID should return ManagedByVmssUniform for vmss uniform node",
@@ -433,9 +452,16 @@ func TestGetVMManagementTypeByIPConfigurationID(t *testing.T) {
 		{
 			description:              "getVMManagementTypeByIPConfigurationID should return ManagedByUnknownVMSet if error happens",
 			ipConfigurationID:        "fakeID",
-			vmListErr:                &azcore.ResponseError{ErrorCode: "failed to list VMs"},
+			vmListErr:                vmListFailure,
 			expectedVMManagementType: ManagedByUnknownVMSet,
-			expectedErr:              fmt.Errorf("failed to list VMs"),
+			expectedErr:              vmListFailure,
+		},
+		{
+			description:              "getVMManagementTypeByIPConfigurationID should return the original VM list error for HTTP 404",
+			ipConfigurationID:        "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/testvm1-nic/ipConfigurations/pipConfig",
+			vmListErr:                vmListNotFound,
+			expectedVMManagementType: ManagedByUnknownVMSet,
+			expectedErr:              vmListNotFound,
 		},
 	}
 
@@ -472,8 +498,99 @@ func TestGetVMManagementTypeByIPConfigurationID(t *testing.T) {
 
 			vmManagementType, err := ss.getVMManagementTypeByIPConfigurationID(context.TODO(), tc.ipConfigurationID, azcache.CacheReadTypeDefault)
 			assert.Equal(t, tc.expectedVMManagementType, vmManagementType, tc.description)
-			if tc.expectedErr != nil {
-				assert.Contains(t, err.Error(), tc.expectedErr.Error(), tc.description)
+			assert.ErrorIs(t, err, tc.expectedErr)
+			switch tc.expectedErr {
+			case errNICNotAttachedToVM:
+				expectedMsg := fmt.Sprintf("failed to get vm name by ip config ID %s: failed to get vm ID of nic %s", tc.ipConfigurationID, tc.expectedNIC)
+				assert.ErrorContains(t, err, expectedMsg)
+			case errNICNotFound:
+				assert.ErrorIs(t, err, tc.nicGetErr)
+				assert.NotErrorIs(t, err, cloudprovider.InstanceNotFound)
+			case vmListNotFound:
+				assert.NotErrorIs(t, err, errNICNotFound)
+				assert.NotErrorIs(t, err, cloudprovider.InstanceNotFound)
+			}
+		})
+	}
+}
+
+func TestGetVMNameByIPConfigurationName(t *testing.T) {
+	const nicName = "test-nic"
+	serverError := &azcore.ResponseError{StatusCode: http.StatusInternalServerError}
+	for _, tc := range []struct {
+		name            string
+		nicProperties   *armnetwork.InterfacePropertiesFormat
+		nicGetErr       error
+		wantVMName      string
+		wantErr         error
+		wantErrText     string
+		errMustNotMatch error
+	}{
+		{
+			name:          "GetVMNameByIPConfigurationName should return the VM name from an attached NIC's VM resource ID",
+			nicProperties: buildTestNICWithVMName("test-vm").Properties,
+			wantVMName:    "test-vm",
+		},
+		{
+			name:            "GetVMNameByIPConfigurationName should report a missing NIC when the NIC GET returns HTTP 404",
+			nicGetErr:       &azcore.ResponseError{StatusCode: http.StatusNotFound},
+			wantErr:         errNICNotFound,
+			errMustNotMatch: cloudprovider.InstanceNotFound,
+		},
+		{
+			name:      "GetVMNameByIPConfigurationName should propagate HTTP 500 from the NIC GET",
+			nicGetErr: serverError,
+			wantErr:   serverError,
+		},
+		{
+			name:            "GetVMNameByIPConfigurationName should reject nil NIC properties without treating the NIC as detached",
+			wantErrText:     "failed to get vm ID of nic test-nic: NIC properties are missing",
+			errMustNotMatch: errNICNotAttachedToVM,
+		},
+		{
+			name:          "GetVMNameByIPConfigurationName should report a detached NIC when it has no VM reference",
+			nicProperties: &armnetwork.InterfacePropertiesFormat{},
+			wantErr:       errNICNotAttachedToVM,
+			wantErrText:   "failed to get vm ID of nic test-nic: NIC is not attached to a VM",
+		},
+		{
+			name:          "GetVMNameByIPConfigurationName should report a detached NIC when its VM reference has no ID",
+			nicProperties: &armnetwork.InterfacePropertiesFormat{VirtualMachine: &armnetwork.SubResource{}},
+			wantErr:       errNICNotAttachedToVM,
+		},
+		{
+			name:          "GetVMNameByIPConfigurationName should reject an empty VM resource ID string in the NIC",
+			nicProperties: &armnetwork.InterfacePropertiesFormat{VirtualMachine: &armnetwork.SubResource{ID: ptr.To("")}},
+			wantErrText:   "invalid virtual machine ID",
+		},
+		{
+			name:          "GetVMNameByIPConfigurationName should reject a malformed VM resource ID in the NIC",
+			nicProperties: &armnetwork.InterfacePropertiesFormat{VirtualMachine: &armnetwork.SubResource{ID: ptr.To("invalid")}},
+			wantErrText:   "invalid virtual machine ID invalid",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			az := GetTestCloud(gomock.NewController(t))
+			mockNICClient := az.ComputeClientFactory.GetInterfaceClient().(*mock_interfaceclient.MockInterface)
+			var nic *armnetwork.Interface
+			if tc.nicGetErr == nil {
+				nic = &armnetwork.Interface{Name: ptr.To(nicName), Properties: tc.nicProperties}
+			}
+			mockNICClient.EXPECT().Get(gomock.Any(), "rg", nicName, nil).Return(nic, tc.nicGetErr)
+
+			vmName, err := az.GetVMNameByIPConfigurationName(t.Context(), "rg", nicName)
+			assert.Equal(t, tc.wantVMName, vmName)
+			if tc.wantErr == nil && tc.wantErrText == "" {
+				assert.NoError(t, err)
+			}
+			if tc.wantErr != nil {
+				assert.ErrorIs(t, err, tc.wantErr)
+			}
+			if tc.wantErrText != "" {
+				assert.ErrorContains(t, err, tc.wantErrText)
+			}
+			if tc.errMustNotMatch != nil {
+				assert.NotErrorIs(t, err, tc.errMustNotMatch)
 			}
 		})
 	}

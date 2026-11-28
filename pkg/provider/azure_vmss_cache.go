@@ -549,10 +549,13 @@ func (ss *ScaleSet) getVMManagementTypeByIPConfigurationID(ctx context.Context, 
 func (az *Cloud) GetVMNameByIPConfigurationName(ctx context.Context, nicResourceGroup, nicName string) (string, error) {
 	nic, rerr := az.ComputeClientFactory.GetInterfaceClient().Get(ctx, nicResourceGroup, nicName, nil)
 	if rerr != nil {
-		return "", fmt.Errorf("failed to get interface of name %s: %w", nicName, rerr)
+		return "", fmt.Errorf("failed to get interface of name %s: %w", nicName, wrapNICNotFound(rerr))
 	}
-	if nic.Properties == nil || nic.Properties.VirtualMachine == nil || nic.Properties.VirtualMachine.ID == nil {
-		return "", fmt.Errorf("failed to get vm ID of nic %s", ptr.Deref(nic.Name, ""))
+	if nic.Properties == nil {
+		return "", fmt.Errorf("failed to get vm ID of nic %s: NIC properties are missing", ptr.Deref(nic.Name, ""))
+	}
+	if nic.Properties.VirtualMachine == nil || nic.Properties.VirtualMachine.ID == nil {
+		return "", fmt.Errorf("failed to get vm ID of nic %s: %w", ptr.Deref(nic.Name, ""), errNICNotAttachedToVM)
 	}
 	vmID := ptr.Deref(nic.Properties.VirtualMachine.ID, "")
 	matches := vmIDRE.FindStringSubmatch(vmID)

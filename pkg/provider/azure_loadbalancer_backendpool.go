@@ -133,17 +133,30 @@ func (bc *backendPoolTypeNodeIPConfig) ReconcileBackendPools(
 			}
 
 			var backendIPConfigurationsToBeDeleted, bipConfigNotFound, bipConfigExclude []*armnetwork.InterfaceIPConfiguration
+			var skippedIPConfigCount int
 			if bp.Properties != nil && bp.Properties.BackendIPConfigurations != nil {
 				for _, ipConf := range bp.Properties.BackendIPConfigurations {
 					ipConfID := ptr.Deref(ipConf.ID, "")
 					nodeName, _, err := bc.VMSet.GetNodeNameByIPConfigurationID(ctx, ipConfID)
 					if err != nil {
-						if errors.Is(err, cloudprovider.InstanceNotFound) {
+						switch {
+						case errors.Is(err, cloudprovider.InstanceNotFound):
 							logger.V(2).Info("vm not found for ipConfID", "serviceName", serviceName, "ipConfID", ipConfID)
 							bipConfigNotFound = append(bipConfigNotFound, ipConf)
-						} else {
+							continue
+						case errors.Is(err, errNICNotFound):
+							logger.V(2).Info("Skipped backend IP configuration because its NIC was not found", "serviceName", serviceName, "ipConfID", ipConfID)
+						case errors.Is(err, errNICNotAttachedToVM):
+							logger.V(2).Info("Skipped backend IP configuration because its NIC is not attached to a VM", "serviceName", serviceName, "ipConfID", ipConfID)
+						default:
 							return false, false, nil, err
 						}
+					}
+					if err != nil || nodeName == "" {
+						// Track skipped IP configurations so they don't count as nodes
+						// that would remain in the pool after removing excluded nodes.
+						skippedIPConfigCount++
+						continue
 					}
 
 					// If a node is not supposed to be included in the LB, it
@@ -162,7 +175,7 @@ func (bc *backendPoolTypeNodeIPConfig) ReconcileBackendPools(
 					}
 				}
 			}
-			backendIPConfigurationsToBeDeleted = getBackendIPConfigurationsToBeDeleted(*bp, bipConfigNotFound, bipConfigExclude)
+			backendIPConfigurationsToBeDeleted = getBackendIPConfigurationsToBeDeleted(*bp, bipConfigNotFound, bipConfigExclude, skippedIPConfigCount)
 			if len(backendIPConfigurationsToBeDeleted) > 0 {
 				backendpoolToBeDeleted = append(backendpoolToBeDeleted, &armnetwork.BackendAddressPool{
 					ID: ptr.To(lbBackendPoolIDs[isIPv6]),
@@ -218,6 +231,7 @@ func (bc *backendPoolTypeNodeIPConfig) ReconcileBackendPools(
 func getBackendIPConfigurationsToBeDeleted(
 	bp armnetwork.BackendAddressPool,
 	bipConfigNotFound, bipConfigExclude []*armnetwork.InterfaceIPConfiguration,
+	skippedIPConfigCount int,
 ) []*armnetwork.InterfaceIPConfiguration {
 	logger := log.Background().WithName("getBackendIPConfigurationsToBeDeleted")
 	if bp.Properties == nil || bp.Properties.BackendIPConfigurations == nil {
@@ -250,7 +264,8 @@ func getBackendIPConfigurationsToBeDeleted(
 			unwantedIPConfigs = append(unwantedIPConfigs, ipConfig)
 		}
 	}
-	if len(unwantedIPConfigs) == len(ipConfigs) {
+	// Skipped backend IP configurations do not count as remaining nodes.
+	if len(unwantedIPConfigs) == len(ipConfigs)-skippedIPConfigCount {
 		logger.V(2).Info("the pool is empty or will be empty after removing the unwanted IP addresses, skipping the removal")
 		return bipConfigToBeDeleted
 	}

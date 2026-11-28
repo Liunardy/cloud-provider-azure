@@ -20,11 +20,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v12"
+	"github.com/go-logr/logr/funcr"
 	"github.com/stretchr/testify/assert"
 
 	"go.uber.org/mock/gomock"
@@ -38,6 +40,7 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/backendaddresspoolclient/mock_backendaddresspoolclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/loadbalancerclient/mock_loadbalancerclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
+	"sigs.k8s.io/cloud-provider-azure/pkg/log"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/config"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
@@ -543,33 +546,173 @@ func TestReconcileBackendPoolsNodeIPConfigRemoveIPConfig(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
+	const (
+		excludedNodeName          = "k8s-agentpool1-00000000"
+		nonExcludedNodeName       = "k8s-agentpool2-00000000"
+		nicIDPrefix               = "/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/"
+		excludedIPConfigID        = nicIDPrefix + excludedNodeName + "-nic-1/ipConfigurations/ipconfig1"
+		detachedNICIPConfigID     = nicIDPrefix + "detached/ipConfigurations/ipconfig1"
+		nonExcludedNodeIPConfigID = nicIDPrefix + nonExcludedNodeName + "-nic-1/ipConfigurations/ipconfig1"
+		missingVMIPConfigID       = nicIDPrefix + "k8s-agentpool3-00000000-nic-1/ipConfigurations/ipconfig1"
+		missingNICIPConfigID      = nicIDPrefix + "missing/ipConfigurations/ipconfig1"
+	)
 	lb := buildDefaultTestLB(testClusterName, []string{
-		"/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/k8s-agentpool1-00000000-nic-1/ipConfigurations/ipconfig1",
-		"/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/k8s-agentpool2-00000000-nic-1/ipConfigurations/ipconfig1",
-		"/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/k8s-agentpool3-00000000-nic-1/ipConfigurations/ipconfig1",
+		excludedIPConfigID, detachedNICIPConfigID, nonExcludedNodeIPConfigID, missingVMIPConfigID, missingNICIPConfigID,
 	})
 
 	mockVMSet := NewMockVMSet(ctrl)
-	mockVMSet.EXPECT().GetNodeNameByIPConfigurationID(gomock.Any(), "/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/k8s-agentpool1-00000000-nic-1/ipConfigurations/ipconfig1").Return("k8s-agentpool1-00000000", "", nil)
-	mockVMSet.EXPECT().GetNodeNameByIPConfigurationID(gomock.Any(), "/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/k8s-agentpool2-00000000-nic-1/ipConfigurations/ipconfig1").Return("k8s-agentpool2-00000000", "", nil)
-	mockVMSet.EXPECT().GetNodeNameByIPConfigurationID(gomock.Any(), "/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/k8s-agentpool3-00000000-nic-1/ipConfigurations/ipconfig1").Return("", "", cloudprovider.InstanceNotFound)
-	mockVMSet.EXPECT().EnsureBackendPoolDeleted(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(false, nil)
-	mockVMSet.EXPECT().GetPrimaryVMSetName().Return("k8s-agentpool1-00000000").Times(2)
+	mockVMSet.EXPECT().GetNodeNameByIPConfigurationID(gomock.Any(), excludedIPConfigID).Return(excludedNodeName, "", nil)
+	mockVMSet.EXPECT().GetNodeNameByIPConfigurationID(gomock.Any(), detachedNICIPConfigID).Return("", "", fmt.Errorf("lookup: %w", errNICNotAttachedToVM))
+	mockVMSet.EXPECT().GetNodeNameByIPConfigurationID(gomock.Any(), nonExcludedNodeIPConfigID).Return(nonExcludedNodeName, "", nil)
+	mockVMSet.EXPECT().GetNodeNameByIPConfigurationID(gomock.Any(), missingVMIPConfigID).Return("", "", fmt.Errorf("VM lookup: %w", cloudprovider.InstanceNotFound))
+	mockVMSet.EXPECT().GetNodeNameByIPConfigurationID(gomock.Any(), missingNICIPConfigID).Return("", "", fmt.Errorf("NIC lookup: %w", errNICNotFound))
+	mockVMSet.EXPECT().GetPrimaryVMSetName().Return("k8s-agentpool1-00000000")
 
 	az := GetTestCloud(ctrl)
 	az.VMSet = mockVMSet
 	az.nodeInformerSynced = func() bool { return true }
-	az.excludeLoadBalancerNodes = utilsets.NewString("k8s-agentpool1-00000000")
+	az.excludeLoadBalancerNodes = utilsets.NewString(excludedNodeName)
+	backendPoolID := az.getBackendPoolID(testClusterName, testClusterName)
+	wantPools := []*armnetwork.BackendAddressPool{{
+		ID: ptr.To(backendPoolID),
+		Properties: &armnetwork.BackendAddressPoolPropertiesFormat{
+			BackendIPConfigurations: []*armnetwork.InterfaceIPConfiguration{
+				{ID: ptr.To(missingVMIPConfigID)},
+				{ID: ptr.To(excludedIPConfigID)},
+			},
+		},
+	}}
+	mockVMSet.EXPECT().EnsureBackendPoolDeleted(gomock.Any(), gomock.Any(), []string{backendPoolID}, gomock.Any(), wantPools, false).Return(false, nil)
 
 	bc := newBackendPoolTypeNodeIPConfig(az)
 	svc := getTestService("test", v1.ProtocolTCP, nil, false, 80)
-	_, _, updatedLB, err := bc.ReconcileBackendPools(context.TODO(), testClusterName, &svc, &lb)
+	var logs strings.Builder
+	ctx := log.NewContext(t.Context(), funcr.New(func(_, message string) { fmt.Fprintln(&logs, message) }, funcr.Options{Verbosity: 2}))
+	_, _, updatedLB, err := bc.ReconcileBackendPools(ctx, testClusterName, &svc, &lb)
 	assert.NoError(t, err)
 	assert.Equal(t, lb, *updatedLB)
+	assert.Regexp(t, "vm not found for ipConfID.*"+missingVMIPConfigID, logs.String())
+	assert.Regexp(t, "Skipped backend IP configuration because its NIC was not found.*"+missingNICIPConfigID, logs.String())
+	assert.Regexp(t, "Skipped backend IP configuration because its NIC is not attached to a VM.*"+detachedNICIPConfigID, logs.String())
+}
 
-	mockVMSet.EXPECT().GetNodeNameByIPConfigurationID(gomock.Any(), "/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/k8s-agentpool1-00000000-nic-1/ipConfigurations/ipconfig1").Return("k8s-agentpool1-00000000", "", errors.New("error"))
-	_, _, _, err = bc.ReconcileBackendPools(context.TODO(), testClusterName, &svc, &lb)
-	assert.Equal(t, "error", err.Error())
+func TestReconcileBackendPoolsNodeIPConfigCleanup(t *testing.T) {
+	const (
+		excludedNodeName      = "excluded-node"
+		excludedIPConfigID    = "excluded"
+		missingVMIPConfigID   = "missing-vm"
+		detachedNICIPConfigID = "detached-nic"
+		missingNICIPConfigID  = "missing-nic"
+		noNodeNameIPConfigID  = "no-node-name"
+		lookupErrorIPConfigID = "lookup-error"
+		cacheErrorIPConfigID  = "cache-error"
+	)
+	type pool struct {
+		name        string
+		ipConfigIDs []string
+	}
+	poolProperties := func(ids []string) *armnetwork.BackendAddressPoolPropertiesFormat {
+		props := &armnetwork.BackendAddressPoolPropertiesFormat{}
+		for _, id := range ids {
+			props.BackendIPConfigurations = append(props.BackendIPConfigurations, &armnetwork.InterfaceIPConfiguration{ID: ptr.To(id)})
+		}
+		return props
+	}
+	lookupErr := errors.New("error")
+	cacheErr := errors.New("VM cache lookup failed")
+	nodeLookupByIPConfigID := map[string]struct {
+		nodeName string
+		err      error
+	}{
+		excludedIPConfigID:    {nodeName: excludedNodeName},
+		missingVMIPConfigID:   {err: cloudprovider.InstanceNotFound},
+		detachedNICIPConfigID: {err: errNICNotAttachedToVM},
+		missingNICIPConfigID:  {err: errNICNotFound},
+		noNodeNameIPConfigID:  {},
+		lookupErrorIPConfigID: {nodeName: "k8s-agentpool1-00000000", err: lookupErr},
+		cacheErrorIPConfigID:  {err: cacheErr},
+	}
+	ipv4Service := getTestService("test", v1.ProtocolTCP, nil, false, 80)
+	dualStackService := getTestServiceDualStack("test", v1.ProtocolTCP, nil, 80)
+	ipv4Pool := pool{name: testClusterName, ipConfigIDs: []string{excludedIPConfigID}}
+	ipv6Pool := pool{name: getBackendPoolName(testClusterName, consts.IPVersionIPv6), ipConfigIDs: []string{detachedNICIPConfigID, missingNICIPConfigID}}
+
+	for _, tc := range []struct {
+		name        string
+		service     v1.Service
+		pools       []pool
+		wantCleanup []pool
+		wantErr     error
+	}{
+		{
+			name:        "only one lookup returns a node name: keep that excluded node and queue only the missing VM's IP configuration",
+			service:     ipv4Service,
+			pools:       []pool{{name: testClusterName, ipConfigIDs: []string{missingVMIPConfigID, detachedNICIPConfigID, missingNICIPConfigID, noNodeNameIPConfigID, excludedIPConfigID}}},
+			wantCleanup: []pool{{name: testClusterName, ipConfigIDs: []string{missingVMIPConfigID}}},
+		},
+		{
+			name:    "IPv4 pool listed first: no cleanup when IPv4 has only an excluded node and IPv6 references a detached NIC and a missing NIC",
+			service: dualStackService,
+			pools:   []pool{ipv4Pool, ipv6Pool},
+		},
+		{
+			name:    "IPv6 pool listed first: no cleanup when IPv4 has only an excluded node and IPv6 references a detached NIC and a missing NIC",
+			service: dualStackService,
+			pools:   []pool{ipv6Pool, ipv4Pool},
+		},
+		{
+			name:    "first node lookup fails: return the error without cleanup",
+			service: ipv4Service,
+			pools:   []pool{{name: testClusterName, ipConfigIDs: []string{lookupErrorIPConfigID}}},
+			wantErr: lookupErr,
+		},
+		{
+			name:    "node lookup fails after a missing VM and a detached NIC: return the error without partial cleanup",
+			service: ipv4Service,
+			pools:   []pool{{name: testClusterName, ipConfigIDs: []string{missingVMIPConfigID, detachedNICIPConfigID, cacheErrorIPConfigID}}},
+			wantErr: cacheErr,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			az := GetTestCloud(ctrl)
+			vmSet := NewMockVMSet(ctrl)
+			az.VMSet = vmSet
+			az.excludeLoadBalancerNodes = utilsets.NewString(excludedNodeName)
+			vmSet.EXPECT().GetPrimaryVMSetName().Return("vmss")
+
+			lb := &armnetwork.LoadBalancer{Name: ptr.To(testClusterName), Properties: &armnetwork.LoadBalancerPropertiesFormat{}}
+			for _, p := range tc.pools {
+				lb.Properties.BackendAddressPools = append(lb.Properties.BackendAddressPools, &armnetwork.BackendAddressPool{
+					Name: ptr.To(p.name), Properties: poolProperties(p.ipConfigIDs),
+				})
+				for _, id := range p.ipConfigIDs {
+					lookup, ok := nodeLookupByIPConfigID[id]
+					if !ok {
+						t.Fatalf("no node lookup defined for IP configuration %q", id)
+					}
+					vmSet.EXPECT().GetNodeNameByIPConfigurationID(gomock.Any(), id).Return(lookup.nodeName, "", lookup.err)
+				}
+			}
+			if len(tc.wantCleanup) > 0 {
+				var poolIDs []string
+				var cleanupPools []*armnetwork.BackendAddressPool
+				for _, p := range tc.wantCleanup {
+					id := az.getBackendPoolID(testClusterName, p.name)
+					poolIDs = append(poolIDs, id)
+					cleanupPools = append(cleanupPools, &armnetwork.BackendAddressPool{ID: ptr.To(id), Properties: poolProperties(p.ipConfigIDs)})
+				}
+				vmSet.EXPECT().EnsureBackendPoolDeleted(gomock.Any(), gomock.Any(), poolIDs, gomock.Any(), cleanupPools, false).Return(false, nil)
+			}
+
+			_, poolAddedToLB, updatedLB, err := newBackendPoolTypeNodeIPConfig(az).ReconcileBackendPools(t.Context(), testClusterName, &tc.service, lb)
+			assert.ErrorIs(t, err, tc.wantErr)
+			if tc.wantErr == nil && assert.NotNil(t, updatedLB) {
+				assert.False(t, poolAddedToLB, "all requested backend pools already exist")
+				assert.Len(t, updatedLB.Properties.BackendAddressPools, len(tc.pools))
+			}
+		})
+	}
 }
 
 func TestReconcileBackendPoolsNodeIPConfigPreConfigured(t *testing.T) {
@@ -1051,6 +1194,7 @@ func TestGetBackendIPConfigurationsToBeDeleted(t *testing.T) {
 	for _, tc := range []struct {
 		description                         string
 		bipConfigNotFound, bipConfigExclude []*armnetwork.InterfaceIPConfiguration
+		skippedIPConfigCount                int
 		expected                            map[string]bool
 	}{
 		{
@@ -1096,6 +1240,28 @@ func TestGetBackendIPConfigurationsToBeDeleted(t *testing.T) {
 				"ipconfig3": true,
 			},
 		},
+		{
+			description:          "should return only the IP configuration for the VM that was not found when one NIC is skipped and the remaining node is excluded",
+			bipConfigNotFound:    []*armnetwork.InterfaceIPConfiguration{{ID: ptr.To("ipconfig1")}},
+			bipConfigExclude:     []*armnetwork.InterfaceIPConfiguration{{ID: ptr.To("ipconfig3")}},
+			skippedIPConfigCount: 1,
+			expected:             map[string]bool{"ipconfig1": true},
+		},
+		{
+			description:          "should return only the excluded node's IP configuration for removal when one NIC is skipped and a non-excluded node remains",
+			bipConfigExclude:     []*armnetwork.InterfaceIPConfiguration{{ID: ptr.To("ipconfig2")}},
+			skippedIPConfigCount: 1,
+			expected:             map[string]bool{"ipconfig2": true},
+		},
+		{
+			description: "should return no IP configurations for removal when one NIC is skipped and both remaining nodes are excluded",
+			bipConfigExclude: []*armnetwork.InterfaceIPConfiguration{
+				{ID: ptr.To("ipconfig2")},
+				{ID: ptr.To("ipconfig3")},
+			},
+			skippedIPConfigCount: 1,
+			expected:             map[string]bool{},
+		},
 	} {
 		bp := armnetwork.BackendAddressPool{
 			Properties: &armnetwork.BackendAddressPoolPropertiesFormat{
@@ -1107,11 +1273,11 @@ func TestGetBackendIPConfigurationsToBeDeleted(t *testing.T) {
 			},
 		}
 
-		ipConfigs := getBackendIPConfigurationsToBeDeleted(bp, tc.bipConfigNotFound, tc.bipConfigExclude)
+		ipConfigs := getBackendIPConfigurationsToBeDeleted(bp, tc.bipConfigNotFound, tc.bipConfigExclude, tc.skippedIPConfigCount)
 		actual := make(map[string]bool)
 		for _, ipConfig := range ipConfigs {
 			actual[*ipConfig.ID] = true
 		}
-		assert.Equal(t, tc.expected, actual)
+		assert.Equal(t, tc.expected, actual, tc.description)
 	}
 }
